@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.nn import init as init
 from collections import OrderedDict
 import math
+import os
 
 class conv_bn_relu(nn.Module):
     def __init__(self, in_channels, out_channels, activation=True, **kwargs):
@@ -110,3 +111,199 @@ class ResBlock(nn.Module):
         out2 = self.res2a(x)
         out = out1 + out2
         return out
+
+class PeleeNet(nn.Module):
+    def __init__(self, phase, size, cfg=None):
+        super(PeleeNet, self).__init__()
+        self.phase = phase
+        self.size = size
+        self.cfg = cfg
+
+        self.features = nn.Sequential(OrderedDict([
+            ('stemblock', _StemBlock(3, cfg.num_init_features)),
+        ]))
+
+        if type(cfg.growth_rate) is list:
+            growth_rates = cfg.growth_rate
+            assert len(growth_rates) == 4, 'The growth rate must be the list and the size must be 4'
+        else:
+            growth_rates = [cfg.growth_rate] * 4
+        
+        if type(cfg.bottleneck_width) is list:
+            bottleneck_widths = cfg.bottleneck_width
+            assert len(bottleneck_widths) == 4, 'The bottleneck width must be the list and the size must be 4'
+        else:
+            bottleneck_widths = [cfg.bottleneck_width] * 4
+
+        num_features = cfg.num_init_features
+        for i, num_layers in enumerate(cfg.block_config):
+            block = _DenseBlock(num_layers=num_layers,num_input_features=num_features,bn_size=bottleneck_widths[i], growth_rate=growth_rates[i], drop_rate=cfg.drop_rate)
+            self.features.add_module('denseblock%d' % (i+1), block)
+            num_features = num_features + num_layers * growth_rates[i]
+
+            self.features.add_module('transition%d' % (i+1), conv_bn_relu(
+                num_features, num_features, kernel_size=1, stride=1, padding=0
+            ))
+
+            if i!= len(cfg.block_config) - 1:
+                self.features.add_module('transition%d_pool' % (
+                    i + 1), nn.AvgPool2d(kernel_size=2, stride=2, ceil_mode=True))
+                num_features = num_features
+        
+        extras = add_extras(704, batch_norm=True)
+        self.extras = nn.ModuleList(extras)
+
+        nchannels = [512, 704, 256, 256, 256]
+
+        resblock = add_resblock(nchannels)
+        self.resblock = nn.ModuleList(resblock)
+
+        self.loc = nn.ModuleList()
+        self.conf = nn.ModuleList()
+
+        for i, x in enumerate([256] * 5):
+            n = cfg.anchor_config.anchor_nums[i]
+            self.loc.append(nn.Conv2d(x, n*4, kernel_size=1))
+            self.conf.append(nn.Conv2d(x, n*cfg.num_classes, kernel_size=1))
+        
+        if self.phase == 'test':
+            self.softmax = nn.Softmax(dim=-1)
+    
+    def forward(self, x):
+        sources = list()
+        loc = list()
+        conf = list()
+        for k, feat in enumerate(self.features):
+            x = feat(x)
+            if k == 8 or k == len(self.features) - 1:
+                sources += [x]
+
+        for k, v in enumerate(self.extras):
+            x = v(x)
+            if k % 2 == 1:
+                sources += [x]
+
+        for k, x in enumerate(sources):
+            sources[k] = self.resblock[k](x)
+
+        for (x, l, c) in zip(sources, self.loc, self.conf):
+            loc.append(l(x).permute(0, 2, 3, 1).contiguous())
+            conf.append(c(x).permute(0, 2, 3, 1).contiguous())
+
+        loc = torch.cat([o.view(o.size(0), -1) for o in loc], 1)
+        conf = torch.cat([o.view(o.size(0), -1) for o in conf], 1)
+
+        if self.phase == 'test':
+            output = (
+                loc.view(loc.size(0), -1, 4),                   # loc preds
+                self.softmax(conf.view(-1, self.cfg.num_classes))  # conf preds
+            )
+        else:
+            output = (
+                loc.view(loc.size(0), -1, 4),
+                conf.view(conf.size(0), -1, self.cfg.num_classes)
+            )
+        return output
+
+    def init_model(self, pretained_model):
+        base_state = torch.load(pretained_model)
+        self.features.load_state_dict(base_state)
+        print('Loading base network...')
+
+        def weights_init(m):
+            '''
+            for key in m.state_dict():
+                if key.split('.')[-1] == 'weight':
+                    if 'conv' in key:
+                        init.kaiming_normal_(
+                            m.state_dict()[key], mode='fan_out')
+                    if 'bn' in key:
+                        m.state_dict()[key][...] = 1
+                elif key.split('.')[-1] == 'bias':
+                    m.state_dict()[key][...] = 0
+            '''
+            if isinstance(m,nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight)
+                if 'bias' in m.state_dict().keys():
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+                
+        print(
+            'Initializing weights for [extras, resblock,multibox]...')
+        self.extras.apply(weights_init)
+        self.resblock.apply(weights_init)
+        self.loc.apply(weights_init)
+        self.conf.apply(weights_init)
+
+    def load_weights(self, base_file):
+        other, ext = os.path.splitext(base_file)
+        if ext == '.pkl' or '.pth':
+            print('Loading weights into state dict...')
+            self.load_state_dict(torch.load(base_file))
+            print('Finished!')
+        else:
+            print('Sorry only .pth and .pkl files supported.')
+
+def add_extras(i, batch_norm=False):
+    layers = []
+    in_channels = i
+    channels = [128, 256, 128, 256, 128, 256]
+    stride = [1, 2, 1, 1, 1, 1]
+    padding = [0, 1, 0, 0, 0, 0]
+
+    for k, v in enumerate(channels):
+        if k % 2 == 0:
+            if batch_norm:
+                layers += [conv_bn_relu(in_channels, v,
+                                        kernel_size=1, padding=padding[k])]
+            else:
+                layers += [conv_relu(in_channels, v,
+                                     kernel_size=1, padding=padding[k])]
+        else:
+            if batch_norm:
+                layers += [conv_bn_relu(in_channels, v,
+                                        kernel_size=3, stride=stride[k], padding=padding[k])]
+            else:
+                layers += [conv_relu(in_channels, v,
+                                     kernel_size=3, stride=stride[k], padding=padding[k])]
+        in_channels = v
+
+    return layers
+
+
+def add_resblock(nchannels):
+    layers = []
+    for k, v in enumerate(nchannels):
+        layers += [ResBlock(v)]
+    return layers
+
+
+def build_net(phase, size, config=None):
+    if not phase in ['test', 'train']:
+        raise ValueError("Error: Phase not recognized")
+
+    if size != 304:
+        raise NotImplementedError(
+            "Error: Sorry only Pelee300 are supported!")
+
+    return PeleeNet(phase, size, config)
+
+if __name__ == '__main__':
+    from Configs import Config
+    cfg = Config.fromfile('Pelee_VOC.py')
+    net = PeleeNet('train', 224, cfg.model)
+    print(net)
+    # net.features.load_state_dict(torch.load('./peleenet.pth'))
+    state_dict = torch.load('./weights/peleenet.pth')
+    # print(state_dict.keys())
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        new_state_dict[k[9:]] = v
+
+    torch.save(new_state_dict, './weights/peleenet_new.pth')
+    net.features.load_state_dict(new_state_dict)
+    inputs = torch.randn(2, 3, 304, 304)
+    out = net(inputs)
+    # print(out.size())
